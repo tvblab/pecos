@@ -286,11 +286,32 @@ def parse_arguments():
         help="batch size per GPU.",
     )
     parser.add_argument(
+        "--use-amp",
+        default=False,
+        metavar="[true/false]",
+        type=cli.str2bool,
+        help="enable automatic mixed precision to reduce GPU memory consumption during training.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        default=False,
+        metavar="[true/false]",
+        type=cli.str2bool,
+        help="enable gradient checkpointing for the transformer encoder to save GPU memory.",
+    )
+    parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
         metavar="INT",
         default=1,
         help="number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--max-precompute-instances",
+        type=int,
+        metavar="INT",
+        default=1_000_000,
+        help="maximum number of instances allowed when pre-tensorizing labels; set to 0 to always precompute.",
     )
     parser.add_argument(
         "--learning-rate",
