@@ -293,6 +293,21 @@ def parse_arguments():
         help="number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--mixed-precision",
+        type=cli.str2bool,
+        metavar="[true/false]",
+        default=True,
+        help="Enable automatic mixed precision training when CUDA is available. Default true.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["bfloat16", "float16"],
+        default="bfloat16",
+        metavar="STR",
+        help="Autocast dtype to use when mixed precision training is enabled. Default bfloat16.",
+    )
+    parser.add_argument(
         "--learning-rate",
         default=1e-4,
         metavar="VAL",

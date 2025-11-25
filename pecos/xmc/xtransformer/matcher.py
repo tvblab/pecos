@@ -21,6 +21,7 @@ import pecos
 import scipy.sparse as smat
 import torch
 import transformers
+from torch.cuda.amp import GradScaler, autocast
 from pecos.core import clib
 from pecos.utils import smat_util, torch_util
 from pecos.xmc import MLModel, MLProblem, PostProcessor
@@ -94,6 +95,10 @@ class TransformerMatcher(pecos.BaseClass):
         pre_tokenize (bool, optional): if True, will tokenize training instances before training
             This could potentially accelerate batch-generation but increases memory cost.
             Default False
+        mixed_precision (bool, optional): whether to enable autocast for training to reduce GPU
+            memory consumption when CUDA is available. Default True.
+        amp_dtype (str, optional): autocast dtype to use when mixed_precision is enabled.
+            Supported values are 'bfloat16' and 'float16'. Default 'bfloat16'.
         use_gpu (bool, optional): whether to use GPU even if available. Default True
         eval_by_true_shorlist (bool, optional): if True, will compute validation scores by true label
             shortlisting at intermediat layer. Default False
@@ -133,6 +138,8 @@ class TransformerMatcher(pecos.BaseClass):
         cost_sensitive_ranker: bool = False
         pre_tokenize: bool = True
         pre_tensorize_labels: bool = True
+        mixed_precision: bool = True
+        amp_dtype: str = "bfloat16"
         use_gpu: bool = True
         eval_by_true_shorlist: bool = False
 
@@ -184,6 +191,15 @@ class TransformerMatcher(pecos.BaseClass):
                 if overridden_truncate_length:
                     self.truncate_length = overridden_truncate_length
             return self
+
+    @staticmethod
+    def _get_amp_dtype(dtype_str):
+        if dtype_str is None:
+            return None
+        dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+        if dtype_str not in dtype_map:
+            raise ValueError(f"Unsupported amp_dtype: {dtype_str}")
+        return dtype_map[dtype_str]
 
     def __init__(
         self,
@@ -960,6 +976,14 @@ class TransformerMatcher(pecos.BaseClass):
             self.device
         )
 
+        amp_enabled = (
+            train_params.mixed_precision
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        amp_dtype = self._get_amp_dtype(train_params.amp_dtype) if amp_enabled else None
+        scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+
         logging_steps = train_params.logging_steps
         max_steps = train_params.max_steps
         max_no_improve_cnt = train_params.max_no_improve_cnt
@@ -1061,6 +1085,11 @@ class TransformerMatcher(pecos.BaseClass):
         LOGGER.info("  Learning Rate Schedule = %s", train_params.lr_schedule)
         LOGGER.info("  Batch size = %d", train_params.batch_size)
         LOGGER.info("  Gradient Accumulation steps = %d", train_params.gradient_accumulation_steps)
+        LOGGER.info(
+            "  Mixed precision = %s (dtype=%s)",
+            amp_enabled,
+            train_params.amp_dtype if amp_enabled else None,
+        )
         LOGGER.info("  Total optimization steps = %d", t_total)
 
         global_step = 0
@@ -1088,53 +1117,84 @@ class TransformerMatcher(pecos.BaseClass):
                     "label_values": batch[4],
                     "label_indices": batch[-1] if train_data.has_ns else None,
                 }
-                text_model_W_seq, text_model_b_seq = self.text_model(
-                    output_indices=inputs["label_indices"],
-                    num_device=(
-                        len(self.text_encoder.device_ids)
-                        if hasattr(self.text_encoder, "device_ids")
-                        else 1
-                    ),
-                )
-                outputs = self.text_encoder(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    token_type_ids=inputs["token_type_ids"],
-                    label_embedding=(text_model_W_seq, text_model_b_seq),
-                )
-                loss = loss_function(outputs["logits"], inputs["label_values"].to(self.device))
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    text_model_W_seq, text_model_b_seq = self.text_model(
+                        output_indices=inputs["label_indices"],
+                        num_device=(
+                            len(self.text_encoder.device_ids)
+                            if hasattr(self.text_encoder, "device_ids")
+                            else 1
+                        ),
+                    )
+                    outputs = self.text_encoder(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        token_type_ids=inputs["token_type_ids"],
+                        label_embedding=(text_model_W_seq, text_model_b_seq),
+                    )
+                    loss = loss_function(
+                        outputs["logits"], inputs["label_values"].to(self.device)
+                    )
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-                if train_params.gradient_accumulation_steps > 1:
-                    loss = loss / train_params.gradient_accumulation_steps
+                    if train_params.gradient_accumulation_steps > 1:
+                        loss = loss / train_params.gradient_accumulation_steps
 
-                loss.backward()
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 tr_loss += loss.item()
 
                 logging_elapsed += time.time() - start_time
                 total_train_time += time.time() - start_time
                 if (batch_cnt + 1) % train_params.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.text_encoder.parameters(), train_params.max_grad_norm
-                    )
-
-                    optimizer.step()  # perform gradient update
-                    scheduler.step()  # update learning rate schedule
-                    optimizer.zero_grad()  # clear gradient accumulation
-
-                    if self.text_model.is_sparse:
-                        torch_util.clip_grad_norm_(
-                            self.text_model.parameters(), train_params.max_grad_norm
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.text_encoder.parameters(), train_params.max_grad_norm
                         )
+
+                        if self.text_model.is_sparse:
+                            torch_util.clip_grad_norm_(
+                                self.text_model.parameters(), train_params.max_grad_norm
+                            )
+                        else:
+                            scaler.unscale_(emb_optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.text_model.parameters(), train_params.max_grad_norm
+                            )
+
+                        scaler.step(optimizer)
+                        scheduler.step()
+                        optimizer.zero_grad()
+
+                        scaler.step(emb_optimizer)
+                        emb_scheduler.step()
+                        emb_optimizer.zero_grad()
+                        scaler.update()
                     else:
                         torch.nn.utils.clip_grad_norm_(
-                            self.text_model.parameters(), train_params.max_grad_norm
+                            self.text_encoder.parameters(), train_params.max_grad_norm
                         )
 
-                    emb_optimizer.step()  # perform gradient update
-                    emb_scheduler.step()  # update learning rate schedule
-                    emb_optimizer.zero_grad()  # clear gradient accumulation
+                        optimizer.step()  # perform gradient update
+                        scheduler.step()  # update learning rate schedule
+                        optimizer.zero_grad()  # clear gradient accumulation
+
+                        if self.text_model.is_sparse:
+                            torch_util.clip_grad_norm_(
+                                self.text_model.parameters(), train_params.max_grad_norm
+                            )
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.text_model.parameters(), train_params.max_grad_norm
+                            )
+
+                        emb_optimizer.step()  # perform gradient update
+                        emb_scheduler.step()  # update learning rate schedule
+                        emb_optimizer.zero_grad()  # clear gradient accumulation
                     global_step += 1
 
                     if logging_steps > 0 and global_step % logging_steps == 0:
