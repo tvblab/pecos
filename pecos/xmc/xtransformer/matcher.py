@@ -26,6 +26,7 @@ from pecos.utils import smat_util, torch_util
 from pecos.xmc import MLModel, MLProblem, PostProcessor
 from sklearn.preprocessing import normalize as sk_normalize
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.cuda.amp import GradScaler, autocast
 from transformers import AdamW, AutoConfig, get_scheduler, BatchEncoding
 
 from .module import XMCLabelTensorizer, XMCTextTensorizer, XMCTextDataset
@@ -97,6 +98,10 @@ class TransformerMatcher(pecos.BaseClass):
         use_gpu (bool, optional): whether to use GPU even if available. Default True
         eval_by_true_shorlist (bool, optional): if True, will compute validation scores by true label
             shortlisting at intermediat layer. Default False
+        gradient_checkpointing (bool, optional): enable gradient checkpointing to reduce activation
+            memory during transformer fine-tuning. Default False
+        mixed_precision (str, optional): mixed precision mode for transformer fine-tuning.
+            One of {"none", "fp16", "bf16"}. Default "none".
 
         checkpoint_dir (str): path to save training checkpoints. Default empty to use a temp dir.
         cache_dir (str): dir to store the pre-trained models downloaded from
@@ -135,6 +140,8 @@ class TransformerMatcher(pecos.BaseClass):
         pre_tensorize_labels: bool = True
         use_gpu: bool = True
         eval_by_true_shorlist: bool = False
+        gradient_checkpointing: bool = False
+        mixed_precision: str = "none"
 
         checkpoint_dir: str = ""
         cache_dir: str = ""
@@ -964,6 +971,26 @@ class TransformerMatcher(pecos.BaseClass):
         max_steps = train_params.max_steps
         max_no_improve_cnt = train_params.max_no_improve_cnt
 
+        amp_mode = train_params.mixed_precision.lower()
+        if amp_mode not in {"none", "fp16", "bf16"}:
+            raise ValueError(
+                f"Unsupported mixed_precision option: {train_params.mixed_precision}"
+            )
+
+        amp_dtype = torch.float32
+        if amp_mode == "fp16":
+            amp_dtype = torch.float16
+        elif amp_mode == "bf16":
+            amp_dtype = torch.bfloat16
+
+        use_autocast = amp_mode != "none" and self.device.type == "cuda"
+        if amp_mode != "none" and not use_autocast:
+            LOGGER.warning(
+                "Mixed precision was requested but CUDA device is unavailable; proceeding in full precision."
+            )
+
+        scaler = GradScaler(enabled=use_autocast and amp_dtype == torch.float16)
+
         if prob.M is None or train_params.max_num_labels_in_gpu >= self.nr_labels:
             # put text_model to GPU
             self.text_model.to(self.device)
@@ -974,6 +1001,13 @@ class TransformerMatcher(pecos.BaseClass):
             pre_tensorize_labels=train_params.pre_tensorize_labels,
             input_transform=None if prob.is_tokenized else self._tokenize,
         )
+
+        if train_params.gradient_checkpointing and hasattr(
+            self.text_encoder, "gradient_checkpointing_enable"
+        ):
+            self.text_encoder.gradient_checkpointing_enable()
+            if hasattr(self.text_encoder.config, "use_cache"):
+                self.text_encoder.config.use_cache = False
 
         # since number of active labels may vary
         # using pinned memory will slow down data loading
@@ -1061,6 +1095,8 @@ class TransformerMatcher(pecos.BaseClass):
         LOGGER.info("  Learning Rate Schedule = %s", train_params.lr_schedule)
         LOGGER.info("  Batch size = %d", train_params.batch_size)
         LOGGER.info("  Gradient Accumulation steps = %d", train_params.gradient_accumulation_steps)
+        LOGGER.info("  Gradient checkpointing = %s", train_params.gradient_checkpointing)
+        LOGGER.info("  Mixed precision = %s", amp_mode)
         LOGGER.info("  Total optimization steps = %d", t_total)
 
         global_step = 0
@@ -1088,40 +1124,46 @@ class TransformerMatcher(pecos.BaseClass):
                     "label_values": batch[4],
                     "label_indices": batch[-1] if train_data.has_ns else None,
                 }
-                text_model_W_seq, text_model_b_seq = self.text_model(
-                    output_indices=inputs["label_indices"],
-                    num_device=(
-                        len(self.text_encoder.device_ids)
-                        if hasattr(self.text_encoder, "device_ids")
-                        else 1
-                    ),
-                )
-                outputs = self.text_encoder(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    token_type_ids=inputs["token_type_ids"],
-                    label_embedding=(text_model_W_seq, text_model_b_seq),
-                )
-                loss = loss_function(outputs["logits"], inputs["label_values"].to(self.device))
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                with autocast(enabled=use_autocast, dtype=amp_dtype):
+                    text_model_W_seq, text_model_b_seq = self.text_model(
+                        output_indices=inputs["label_indices"],
+                        num_device=(
+                            len(self.text_encoder.device_ids)
+                            if hasattr(self.text_encoder, "device_ids")
+                            else 1
+                        ),
+                    )
+                    outputs = self.text_encoder(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        token_type_ids=inputs["token_type_ids"],
+                        label_embedding=(text_model_W_seq, text_model_b_seq),
+                    )
+                    loss = loss_function(
+                        outputs["logits"], inputs["label_values"].to(self.device)
+                    )
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-                if train_params.gradient_accumulation_steps > 1:
-                    loss = loss / train_params.gradient_accumulation_steps
+                    if train_params.gradient_accumulation_steps > 1:
+                        loss = loss / train_params.gradient_accumulation_steps
 
-                loss.backward()
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 tr_loss += loss.item()
 
                 logging_elapsed += time.time() - start_time
                 total_train_time += time.time() - start_time
                 if (batch_cnt + 1) % train_params.gradient_accumulation_steps == 0:
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                        scaler.unscale_(emb_optimizer)
+
                     torch.nn.utils.clip_grad_norm_(
                         self.text_encoder.parameters(), train_params.max_grad_norm
                     )
-
-                    optimizer.step()  # perform gradient update
-                    scheduler.step()  # update learning rate schedule
-                    optimizer.zero_grad()  # clear gradient accumulation
 
                     if self.text_model.is_sparse:
                         torch_util.clip_grad_norm_(
@@ -1132,9 +1174,24 @@ class TransformerMatcher(pecos.BaseClass):
                             self.text_model.parameters(), train_params.max_grad_norm
                         )
 
-                    emb_optimizer.step()  # perform gradient update
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                    else:
+                        optimizer.step()
+
+                    if scaler.is_enabled():
+                        scaler.step(emb_optimizer)
+                    else:
+                        emb_optimizer.step()
+
+                    scheduler.step()  # update learning rate schedule
                     emb_scheduler.step()  # update learning rate schedule
+
+                    optimizer.zero_grad()  # clear gradient accumulation
                     emb_optimizer.zero_grad()  # clear gradient accumulation
+
+                    if scaler.is_enabled():
+                        scaler.update()
                     global_step += 1
 
                     if logging_steps > 0 and global_step % logging_steps == 0:

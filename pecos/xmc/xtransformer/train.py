@@ -293,6 +293,21 @@ def parse_arguments():
         help="number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--gradient-checkpointing",
+        type=cli.str2bool,
+        metavar="[true/false]",
+        default=False,
+        help="enable gradient checkpointing to reduce activation memory during fine-tuning.",
+    )
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        choices=["none", "fp16", "bf16"],
+        default="none",
+        metavar="STR",
+        help="enable mixed precision for transformer fine-tuning (fp16 or bf16).",
+    )
+    parser.add_argument(
         "--learning-rate",
         default=1e-4,
         metavar="VAL",
