@@ -15,6 +15,17 @@ Basic Training and predicting:
   > python3 -m pecos.xmc.xtransformer.predict -t ${Tt_path} -x ${Xt_path} -m ${model_dir} -o ${Pt_path}
 ```
 
+Memory-friendly training for very large datasets (e.g., millions of rows) can be enabled via:
+
+```bash
+  > python3 -m pecos.xmc.xtransformer.train -t ${T_path} -x ${X_path} -y ${Y_path} -m ${model_dir} \
+        --use-amp true --gradient-checkpointing true --max-precompute-instances 1000000
+```
+
+* `--use-amp true` enables automatic mixed precision on CUDA devices to shrink activation memory.
+* `--gradient-checkpointing true` saves memory on the transformer encoder by recomputing activations.
+* `--max-precompute-instances` controls when label tensors are pre-generated; setting a finite cap prevents massive datasets from precomputing all labels and falling back to on-the-fly tensorization instead.
+
 To get the evaluation metrics for top-10 predictions:
 ```bash
   > python3 -m pecos.xmc.xlinear.evaluate -y ${Yt_path} -p ${Pt_path} -k 10
