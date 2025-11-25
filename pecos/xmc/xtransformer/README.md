@@ -42,6 +42,15 @@ For detailed usage, please refer to
   > python3 -m pecos.xmc.xtransformer.encode --help
 ```
 
+## Scaling to larger datasets
+
+When working with corpora that have millions of rows and thousands of labels, GPU memory can become
+a bottleneck during fine-tuning. Mixed precision training is enabled by default via
+`--mixed-precision true` with `--amp-dtype bfloat16`, which reduces activation memory without changing
+the command interface. For extremely large problems (for example, 5K labels with 10M rows), you can
+also disable pre-tensorizing label data using `--pre-tensorize-labels false` to lower host memory
+pressure and tune `--batch-size` to fit your hardware budget.
+
 ### Advanced Usage: Give parameters via a JSON file
 `pecos.xmc.xtransformer` supports accepting training and predicting parameters from an input JSON file.
 Moreover, `python3 -m pecos.xmc.xtransformer.train` helpfully provide the option to generate all parameters in JSON format to stdout.
